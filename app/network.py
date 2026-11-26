@@ -7,6 +7,7 @@ logic can be tested with a fake clock.
 from __future__ import annotations
 
 import itertools
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -17,6 +18,14 @@ def wall_clock_ms() -> int:
     """Monotonic clock used by the running web application."""
 
     return int(time.monotonic() * 1000)
+
+
+#: Reservable bandwidth on every ring link, in Mbps.  The capacity is shared by
+#: traffic in both directions (one bucket per link, not one per direction).
+LINK_CAPACITY_MBPS = 100
+
+#: Upper bound for a single registration, only to reject fat-fingered input.
+MAX_DEMAND_MBPS = 1_000_000
 
 
 class NetworkEngine:
@@ -54,6 +63,8 @@ class NetworkEngine:
         self._now_func = now_func
         self._start_ms = now_func()
         self._id_counter = itertools.count(1)
+        self._service_seq = itertools.count(1)
+        self.services = []
         self._scheduler_stop = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
         self.reset()
@@ -66,6 +77,10 @@ class NetworkEngine:
         with self._lock:
             self._start_ms = self._now_func()
             self._id_counter = itertools.count(1)
+            self._service_seq = itertools.count(1)
+            # Registered services in registration order (deletions remove rows,
+            # status changes never reorder them).
+            self.services: list[dict[str, Any]] = []
             self.links: list[dict[str, Any]] = []
             for index, (link_id, source, target) in enumerate(self.DEFAULT_LINKS):
                 self.links.append(
@@ -85,7 +100,10 @@ class NetworkEngine:
             self.commands: list[dict[str, Any]] = []
             self.events: list[dict[str, Any]] = []
             self.last_probe: Optional[dict[str, Any]] = None
-            self._log_locked("reset", "演练已重置：三条常用链路转发，L41 作为备用链路保持阻塞。")
+            self._log_locked(
+                "reset",
+                "演练已重置：三条常用链路转发，L41 作为备用链路保持阻塞；全部业务登记与带宽预留已清空。",
+            )
             return self.snapshot_locked()
 
     def start_scheduler(self) -> None:
@@ -302,6 +320,9 @@ class NetworkEngine:
                     self._execute_command_locked(command)
                     executed.append(command)
                 self._reconcile_locked()
+            # Any command deadline may have started/stopped a link forwarding;
+            # revalidate bandwidth reservations against the final graph.
+            self._reconcile_services_locked()
         return executed
 
     def _execute_command_locked(self, command: dict[str, Any]) -> None:
@@ -508,17 +529,65 @@ class NetworkEngine:
             self.process_due_commands()
             return self.snapshot_locked()
 
+    def _forwarding_adjacency_locked(self) -> dict[str, list[tuple[str, str]]]:
+        """Adjacency of the graph made only of currently forwarding links."""
+
+        adjacency: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for link in self.links:
+            if link["state"] == "forwarding":
+                adjacency[link["source"]].append((link["target"], link["id"]))
+                adjacency[link["target"]].append((link["source"], link["id"]))
+        return adjacency
+
+    def _forwarding_path_locked(
+        self, source_id: str, target_id: str
+    ) -> Optional[tuple[list[str], list[str]]]:
+        """Unique forwarding path as ``(switch_ids, link_ids)`` or ``None``.
+
+        The forwarding graph is kept acyclic (a forest), so BFS discovers the
+        single path whenever the two switches are in the same component.
+        """
+
+        if source_id == target_id:
+            return [source_id], []
+
+        adjacency = self._forwarding_adjacency_locked()
+        parent: dict[str, tuple[str, str]] = {source_id: ("", "")}
+        queue = deque([source_id])
+
+        while queue:
+            current = queue.popleft()
+            if current == target_id:
+                break
+            for neighbor, link_id in adjacency[current]:
+                if neighbor in parent:
+                    continue
+                parent[neighbor] = (current, link_id)
+                queue.append(neighbor)
+
+        if target_id not in parent:
+            return None
+
+        path_nodes: list[str] = []
+        path_links: list[str] = []
+        cursor = target_id
+        while cursor != source_id:
+            path_nodes.append(cursor)
+            previous, link_id = parent[cursor]
+            path_links.append(link_id)
+            cursor = previous
+        path_nodes.append(source_id)
+        path_nodes.reverse()
+        path_links.reverse()
+        return path_nodes, path_links
+
     def send_broadcast(self, source_id: str) -> dict[str, Any]:
         with self._lock:
             self.process_due_commands()
             if not any(switch["id"] == source_id for switch in self.SWITCHES):
                 raise KeyError(f"未知交换机：{source_id}")
 
-            adjacency: dict[str, list[tuple[str, str]]] = defaultdict(list)
-            for link in self.links:
-                if link["state"] == "forwarding":
-                    adjacency[link["source"]].append((link["target"], link["id"]))
-                    adjacency[link["target"]].append((link["source"], link["id"]))
+            adjacency = self._forwarding_adjacency_locked()
 
             visited = {source_id}
             queue = deque([source_id])
@@ -587,20 +656,289 @@ class NetworkEngine:
             self._log_locked("broadcast", message)
             return probe
 
+    # ------------------------------------------------- bandwidth services
+
+    @staticmethod
+    def parse_demand_mbps(value: Any) -> int:
+        """Validate the operator-provided demand as a positive integer Mbps."""
+
+        if isinstance(value, bool):
+            raise ValueError("带宽必须是正整数 Mbps")
+        if isinstance(value, int):
+            number = value
+        elif isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError("带宽必须是整数 Mbps，不能填写小数")
+            number = int(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not re.fullmatch(r"[0-9]+", text):
+                raise ValueError("带宽必须填写正整数 Mbps")
+            number = int(text)
+        else:
+            raise ValueError("带宽必须是正整数 Mbps")
+
+        if number < 1:
+            raise ValueError("带宽必须是不小于 1 Mbps 的正整数")
+        if number > MAX_DEMAND_MBPS:
+            raise ValueError(f"单笔带宽不能超过 {MAX_DEMAND_MBPS} Mbps")
+        return number
+
+    def register_service(self, source_id: Any, target_id: Any, demand_mbps: Any) -> dict[str, Any]:
+        """Register a business service and immediately try to reserve its path."""
+
+        demand = self.parse_demand_mbps(demand_mbps)
+        source_id = str(source_id)
+        target_id = str(target_id)
+
+        with self._lock:
+            # Let any due failover command (and its reservation reconciliation)
+            # settle before registering against the actual forwarding graph.
+            self.process_due_commands()
+
+            known = {switch["id"] for switch in self.SWITCHES}
+            if source_id not in known:
+                raise KeyError(f"未知起点交换机：{source_id}")
+            if target_id not in known:
+                raise KeyError(f"未知终点交换机：{target_id}")
+            if source_id == target_id:
+                raise ValueError("起点交换机和终点交换机不能相同")
+
+            now_clock = self._clock_ms_locked()
+            service_number = next(self._service_seq)
+            service: dict[str, Any] = {
+                "id": f"svc{service_number}",
+                "order": service_number,
+                "source": source_id,
+                "target": target_id,
+                "source_name": self._switch_name_locked(source_id),
+                "target_name": self._switch_name_locked(target_id),
+                "demand_mbps": demand,
+                "status": "waiting",
+                "path_switch_ids": None,
+                "path_link_ids": None,
+                "candidate_path_switch_ids": None,
+                "candidate_path_link_ids": None,
+                "waiting_reason": "已登记，等待按登记顺序核查实际转发路径与链路额度。",
+                "notice": None,
+                "created_at_clock_ms": now_clock,
+                "updated_at_clock_ms": now_clock,
+            }
+            self.services.append(service)
+            self._log_locked(
+                "service-register",
+                f"{service['id'].upper()} 登记业务：{service['source_name']} → "
+                f"{service['target_name']}，约定带宽 {demand} Mbps（整数，双向共用额度）。",
+            )
+            self._reconcile_services_locked()
+            return self.snapshot_locked()
+
+    def revoke_service(self, service_id: str) -> dict[str, Any]:
+        """Remove a registration, free its quota if active, then backfill."""
+
+        with self._lock:
+            self.process_due_commands()
+            service = next((item for item in self.services if item["id"] == service_id), None)
+            if service is None:
+                raise KeyError(f"未知业务：{service_id}")
+
+            was_reserved = service["status"] == "reserved"
+            path_text = "、".join(link.upper() for link in (service.get("path_link_ids") or []))
+            self.services = [item for item in self.services if item["id"] != service_id]
+            if was_reserved:
+                detail = f"，释放路径（{path_text}）上占用的 {service['demand_mbps']} Mbps"
+            else:
+                detail = "（该业务正在等待，未占用额度）"
+            self._log_locked(
+                "service-revoke",
+                f"{service['id'].upper()} 已撤销{detail}；按同一规则和登记顺序为等待业务补位。",
+            )
+            self._reconcile_services_locked()
+            return self.snapshot_locked()
+
+    # Domain-language aliases for programmatic callers.
+    add_service = register_service
+    create_service = register_service
+    remove_service = revoke_service
+    cancel_service = revoke_service
+
+    def _utilization_locked(self) -> dict[str, int]:
+        """Sum reserved Mbps per link across active services (single direction bucket)."""
+
+        used = {link["id"]: 0 for link in self.links}
+        for service in self.services:
+            if service["status"] != "reserved":
+                continue
+            for link_id in service.get("path_link_ids") or []:
+                if link_id in used:
+                    used[link_id] += int(service["demand_mbps"])
+        return used
+
+    def _service_path_text_locked(self, switch_ids: list[str], link_ids: list[str]) -> str:
+        nodes = " → ".join(self._switch_name_locked(sid) for sid in switch_ids)
+        if link_ids:
+            nodes += "；经 " + "、".join(link_id.upper() for link_id in link_ids)
+        return nodes
+
+    def _reconcile_services_locked(self) -> None:
+        """Apply the drill's reservation rule to every registered service.
+
+        1. Active reservations whose actual forwarding path is unchanged are
+           kept and keep consuming quota; reservations whose path disappeared
+           or changed are released back to the waiting queue.
+        2. Waiting services are offered admission strictly in registration
+           order.  A service is admitted only when every link of its actual
+           forwarding path has enough shared capacity; failure never stops
+           later services from being tried.
+
+        The method is quiet when nothing transitions, because it runs after
+        every command-due drain and on periodic state snapshots.
+        """
+
+        if not getattr(self, "services", None):
+            return
+
+        now_clock = self._clock_ms_locked()
+        ordered = sorted(self.services, key=lambda item: item["order"])
+        used = {link["id"]: 0 for link in self.links}
+
+        # Phase 1: preserve unchanged reservations, release invalid ones.
+        for service in ordered:
+            if service["status"] != "reserved":
+                continue
+            old_links = list(service.get("path_link_ids") or [])
+            current = self._forwarding_path_locked(service["source"], service["target"])
+
+            if current is not None and list(current[1]) == old_links:
+                for link_id in old_links:
+                    used[link_id] = used.get(link_id, 0) + int(service["demand_mbps"])
+                continue
+
+            old_text = "、".join(link_id.upper() for link_id in old_links) or "原路径"
+            if current is None:
+                cause = (
+                    f"链路倒换后，{service['source_name']} 与 {service['target_name']} "
+                    f"已不在同一实际转发连通段，原预留路径（{old_text}）失效"
+                )
+            else:
+                new_text = "、".join(link_id.upper() for link_id in current[1]) or "直连"
+                cause = (
+                    f"链路倒换后实际转发路径由（{old_text}）变为（{new_text}），"
+                    "按规则路径未保持不变"
+                )
+
+            service["status"] = "waiting"
+            service["path_switch_ids"] = None
+            service["path_link_ids"] = None
+            service["candidate_path_switch_ids"] = None
+            service["candidate_path_link_ids"] = None
+            service["notice"] = cause
+            service["waiting_reason"] = f"{cause}；已释放占用额度，按原登记顺序重新排队。"
+            service["updated_at_clock_ms"] = now_clock
+            self._log_locked(
+                "service-released",
+                f"{service['id'].upper()} {cause}；{service['demand_mbps']} Mbps 额度已释放并转为等待。",
+            )
+
+        # Phase 2: admit waiting services in registration order.  ``used`` now
+        # contains exactly the kept reservations plus admissions made below.
+        for service in ordered:
+            if service["status"] == "reserved":
+                continue
+
+            demand = int(service["demand_mbps"])
+            path = self._forwarding_path_locked(service["source"], service["target"])
+            if path is None:
+                service["candidate_path_switch_ids"] = None
+                service["candidate_path_link_ids"] = None
+                service["waiting_reason"] = (
+                    f"无路可走：当前实际转发拓扑中 {service['source_name']} 与 "
+                    f"{service['target_name']} 不在同一连通段；继续等候，"
+                    "链路恢复转发后会按登记顺序自动重试。"
+                )
+                service["updated_at_clock_ms"] = now_clock
+                continue
+
+            path_nodes, path_links = path
+            service["candidate_path_switch_ids"] = path_nodes
+            service["candidate_path_link_ids"] = path_links
+
+            bottleneck_id: Optional[str] = None
+            bottleneck_available = LINK_CAPACITY_MBPS + 1
+            for link_id in path_links:
+                reserved = used.get(link_id, 0)
+                available = LINK_CAPACITY_MBPS - reserved
+                if available < demand and available < bottleneck_available:
+                    bottleneck_id = link_id
+                    bottleneck_available = available
+
+            if bottleneck_id is not None:
+                bottleneck_link = self._link_locked(bottleneck_id)
+                reserved_here = used.get(bottleneck_id, 0)
+                route_text = self._service_path_text_locked(path_nodes, path_links)
+                service["waiting_reason"] = (
+                    f"带宽不足：候选路径 {route_text}；其中 {bottleneck_link['name']} "
+                    f"已预留 {reserved_here}/{LINK_CAPACITY_MBPS} Mbps（双向共用），"
+                    f"仅剩 {bottleneck_available} Mbps，不足本业务 {demand} Mbps。"
+                    "整条路径额度未全部满足，因此不占用任何额度；继续等候，"
+                    "前面的业务变动或撤销后会再次补位。"
+                )
+                service["updated_at_clock_ms"] = now_clock
+                continue
+
+            # Every link has room -> atomic occupation.
+            service["status"] = "reserved"
+            service["path_switch_ids"] = path_nodes
+            service["path_link_ids"] = path_links
+            service["waiting_reason"] = None
+            service["notice"] = None
+            service["updated_at_clock_ms"] = now_clock
+            for link_id in path_links:
+                used[link_id] = used.get(link_id, 0) + demand
+
+            route_text = self._service_path_text_locked(path_nodes, path_links)
+            self._log_locked(
+                "service-reserved",
+                f"{service['id'].upper()} 已预留成功：{route_text}；"
+                f"每段占用 {demand} Mbps，整条路径额度一次性锁定。",
+            )
+
     # ------------------------------------------------------------- snapshot
 
     def snapshot_locked(self) -> dict[str, Any]:
         topology = self.topology_locked()
         pending_count = sum(1 for command in self.commands if command["status"] == "pending")
+        used = self._utilization_locked()
+
+        link_snapshots: list[dict[str, Any]] = []
+        for link in self.links:
+            item = dict(link)
+            reserved_mbps = int(used.get(link["id"], 0))
+            item["capacity_mbps"] = LINK_CAPACITY_MBPS
+            item["reserved_mbps"] = reserved_mbps
+            item["available_mbps"] = LINK_CAPACITY_MBPS - reserved_mbps
+            link_snapshots.append(item)
+
+        service_snapshots = [dict(service) for service in self.services]
+        reserved_services = sum(1 for service in self.services if service["status"] == "reserved")
+        waiting_services = len(self.services) - reserved_services
+
         return {
             "clock_ms": self._clock_ms_locked(),
             "switches": [dict(switch) for switch in self.SWITCHES],
-            "links": [dict(link) for link in self.links],
+            "links": link_snapshots,
             "commands": [dict(command) for command in self.commands],
             "events": [dict(event) for event in self.events],
             "last_probe": dict(self.last_probe) if self.last_probe else None,
             "topology": topology,
             "pending_command_count": pending_count,
+            "link_capacity_mbps": LINK_CAPACITY_MBPS,
+            "services": service_snapshots,
+            "service_summary": {
+                "total": len(self.services),
+                "reserved": reserved_services,
+                "waiting": waiting_services,
+            },
         }
 
     def snapshot(self) -> dict[str, Any]:

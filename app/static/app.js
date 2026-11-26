@@ -21,6 +21,7 @@
   let lastStateClockMs = state.clock_ms || 0;
   let lastStatePerfMs = performance.now();
   let selectedSource = state.last_probe?.source || "s1";
+  const pendingRevokes = new Set();
 
   const topologySvg = document.getElementById("topology");
   const linkList = document.getElementById("link-list");
@@ -35,6 +36,13 @@
   const forwardingSummary = document.getElementById("forwarding-summary");
   const clockEl = document.querySelector(".clock");
   const toast = document.getElementById("toast");
+  const serviceForm = document.getElementById("service-form");
+  const serviceSource = document.getElementById("service-source");
+  const serviceTarget = document.getElementById("service-target");
+  const serviceDemand = document.getElementById("service-demand");
+  const serviceList = document.getElementById("service-list");
+  const serviceEmpty = document.getElementById("service-empty");
+  const serviceSummary = document.getElementById("service-summary");
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -138,15 +146,22 @@
         const pendingClass = pending ? ` pending-${pending.action}` : "";
         const countdown = pending ? remainingText(pending) : "";
         const backupMark = link.designated_backup ? " · 备" : "";
+        const capacity = Number(link.capacity_mbps ?? state.link_capacity_mbps ?? 100);
+        const reserved = Number(link.reserved_mbps ?? 0);
+        const usageRatio = capacity > 0 ? reserved / capacity : 0;
+        const usageClass = reserved >= capacity ? "usage-full" : usageRatio >= 0.8 ? "usage-high" : "usage-ok";
+        const usageText = `预留 ${reserved}/${capacity} Mbps`;
         return `
           <line x1="${p.x}" y1="${p.y}" x2="${q.x}" y2="${q.y}"
                 class="link-line ${link.state}${pendingClass}"
                 data-testid="topology-line-${link.id}" />
           <g class="link-badge" transform="translate(${midX},${midY})" data-state="${link.state}">
-            <rect x="-61" y="-32" width="122" height="64" rx="11"></rect>
-            <text x="0" y="-13" class="lid">${escapeHtml(link.name)}${backupMark}</text>
-            <text x="0" y="5" class="lstate">${stateText(link)}</text>
-            <text x="0" y="23" class="countdown">${escapeHtml(countdown)}</text>
+            <rect x="-65" y="-39" width="130" height="79" rx="11"></rect>
+            <text x="0" y="-20" class="lid">${escapeHtml(link.name)}${backupMark}</text>
+            <text x="0" y="-3" class="lstate">${stateText(link)}</text>
+            <text x="0" y="14" class="countdown">${escapeHtml(countdown)}</text>
+            <text x="0" y="31" class="usage-text ${usageClass}"
+                  data-testid="topology-usage-${link.id}">${escapeHtml(usageText)}</text>
           </g>`;
       })
       .join("");
@@ -223,6 +238,13 @@
             ${link.plugged ? "拔线" : "插回"}
           </button>
         </div>
+        <div class="usage-block" data-role="usage" data-testid="link-usage-${link.id}">
+          <div class="usage-head">
+            <span>带宽预留（双向共用）</span>
+            <span class="usage-num" data-role="usage-num"></span>
+          </div>
+          <div class="usage-bar"><i data-role="usage-bar" data-level="normal"></i></div>
+        </div>
         <div class="pending-note" data-role="pending-note" hidden></div>
       </article>`;
   }
@@ -256,6 +278,26 @@
       if (document.activeElement !== openInput) openInput.value = String(link.open_delay_ms / 1000);
       const blockInput = card.querySelector(".block-delay");
       if (document.activeElement !== blockInput) blockInput.value = String(link.block_delay_ms / 1000);
+
+      const usage = card.querySelector('[data-role="usage"]');
+      if (usage) {
+        const capacity = Number(link.capacity_mbps ?? state.link_capacity_mbps ?? 100);
+        const reserved = Number(link.reserved_mbps ?? 0);
+        const available = Number.isFinite(Number(link.available_mbps))
+          ? Number(link.available_mbps)
+          : capacity - reserved;
+        const pct = capacity > 0 ? Math.max(0, Math.min(100, (reserved / capacity) * 100)) : 0;
+        const level = reserved >= capacity ? "full" : pct >= 80 ? "high" : "normal";
+        usage.dataset.testid = `link-usage-${link.id}`;
+        usage.title = `链路 ${link.name} 双向共用 ${capacity} Mbps，已预留 ${reserved} Mbps，剩余 ${available} Mbps`;
+        const num = usage.querySelector('[data-role="usage-num"]');
+        if (num) num.textContent = `已预留 ${reserved} / ${capacity} Mbps · 剩余 ${available}`;
+        const bar = usage.querySelector('[data-role="usage-bar"]');
+        if (bar) {
+          bar.style.width = `${pct}%`;
+          bar.dataset.level = level;
+        }
+      }
 
       const note = card.querySelector('[data-role="pending-note"]');
       const pending = pendingCommandFor(link.id);
@@ -362,10 +404,98 @@
       </p>`;
   }
 
+  function servicePathHtml(service) {
+    const reserved = service.status === "reserved";
+    const switchIds = reserved ? service.path_switch_ids : service.candidate_path_switch_ids;
+    const linkIds = reserved ? service.path_link_ids : service.candidate_path_link_ids;
+
+    if (!switchIds || switchIds.length === 0) {
+      return reserved ? '<span class="muted">本机端点（0 跳）</span>' : '<span class="muted">暂无可用路径</span>';
+    }
+
+    const chain = switchIds.map((sid) => escapeHtml(switchName(sid))).join(" → ");
+    const links = (linkIds || [])
+      .map((lid) => `<span class="link-chip">${escapeHtml(lid.toUpperCase())}</span>`)
+      .join("");
+    const caption = reserved
+      ? `<div class="path-chain" data-testid="service-path-chain-${service.id}">${chain}</div>
+         <div class="path-links">经 ${links} · 每段预留 <b>${Number(service.demand_mbps)}</b> Mbps（双向共用）</div>`
+      : `<div class="path-chain candidate">候选：${chain}</div>
+         <div class="path-links">${links ? `经 ${links} · <b>尚未占用额度</b>` : "<b>尚未占用额度</b>"}</div>`;
+    return `<div class="service-path ${reserved ? "is-reserved" : "is-candidate"}"
+                 data-testid="service-path-${service.id}">${caption}</div>`;
+  }
+
+  function renderServices() {
+    if (!serviceList) return;
+    const services = state.services || [];
+    const summary = state.service_summary || {
+      total: services.length,
+      reserved: services.filter((s) => s.status === "reserved").length,
+      waiting: services.filter((s) => s.status !== "reserved").length,
+    };
+    const capacity = state.link_capacity_mbps || 100;
+    if (serviceSummary) {
+      serviceSummary.textContent =
+        `共 ${summary.total} 条 · 已预留 ${summary.reserved} 条 · 等待 ${summary.waiting} 条；` +
+        `每链路 ${capacity} Mbps 双向共用`;
+    }
+    if (serviceEmpty) serviceEmpty.hidden = services.length !== 0;
+
+    serviceList.innerHTML = services
+      .map((service) => {
+        const reserved = service.status === "reserved";
+        const statusPill = reserved
+          ? '<span class="service-pill reserved" data-testid="service-status-' +
+            service.id + '">✓ 已预留</span>'
+          : '<span class="service-pill waiting" data-testid="service-status-' +
+            service.id + '">… 等待中</span>';
+        const endpoints = `
+          <div class="endpoint-line"><b>${escapeHtml(service.source_name || switchName(service.source))}</b>
+            <span class="endpoint-arrow">→</span>
+            <b>${escapeHtml(service.target_name || switchName(service.target))}</b></div>
+          <div class="muted small">${escapeHtml(service.source.toUpperCase())} → ${escapeHtml(
+          service.target.toUpperCase()
+        )}</div>`;
+        const reason = reserved
+          ? '<span class="reason-ok">整条实际转发路径额度已锁定。</span>'
+          : `<div class="reason-text" data-testid="service-reason-${service.id}">${escapeHtml(
+              service.waiting_reason || "等待按登记顺序核查。"
+            )}</div>${
+              service.notice
+                ? `<div class="notice-text" data-testid="service-notice-${service.id}">⚠ ${escapeHtml(
+                    service.notice
+                  )}</div>`
+                : ""
+            }`;
+        return `
+          <tr class="service-row ${reserved ? "is-reserved" : "is-waiting"}"
+              data-service-id="${service.id}" data-testid="service-row-${service.id}">
+            <td><span class="order-badge">#${service.order}</span>
+                <span class="muted small">${escapeHtml(service.id.toUpperCase())}</span></td>
+            <td>${endpoints}</td>
+            <td class="demand-cell"><b>${Number(service.demand_mbps)}</b> Mbps</td>
+            <td>${statusPill}</td>
+            <td>${servicePathHtml(service)}</td>
+            <td class="reason-cell">${reason}</td>
+            <td>
+              <button type="button" class="btn btn-danger btn-small revoke-button"
+                      data-service-id="${service.id}"
+                      ${pendingRevokes.has(service.id) ? "disabled" : ""}
+                      data-testid="revoke-service-${service.id}">${
+                        pendingRevokes.has(service.id) ? "撤销中…" : "撤销"
+                      }</button>
+            </td>
+          </tr>`;
+      })
+      .join("");
+  }
+
   function renderAll() {
     renderBadgeAndClock();
     renderTopology();
     renderLinks();
+    renderServices();
     renderCommands();
     renderEvents();
     renderProbe();
@@ -461,6 +591,7 @@
       selectedSource = "s1";
       const radio = broadcastForm.querySelector('input[name="source"][value="s1"]');
       if (radio) radio.checked = true;
+      if (serviceDemand) serviceDemand.value = "";
       setState(next);
     } catch (error) {
       showError(error.message);
@@ -471,6 +602,63 @@
 
   broadcastForm.querySelectorAll('input[name="source"]').forEach((radio) => {
     radio.addEventListener("change", () => selectSource(radio.value));
+  });
+
+  serviceForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const source = serviceSource.value;
+    const target = serviceTarget.value;
+    const rawDemand = String(serviceDemand.value || "").trim();
+    if (source === target) {
+      showError("起点交换机和终点交换机不能相同，请重新选择。");
+      return;
+    }
+    if (!/^\d+$/.test(rawDemand)) {
+      showError("带宽必须填写正整数 Mbps（不能是小数、0 或留空）。");
+      serviceDemand.focus();
+      return;
+    }
+    const demand = Number(rawDemand);
+    if (!Number.isSafeInteger(demand) || demand < 1) {
+      showError("带宽必须是不小于 1 的整数 Mbps。");
+      return;
+    }
+
+    const submitButton = document.getElementById("service-submit");
+    if (submitButton) submitButton.disabled = true;
+    try {
+      const next = await api("/api/services", {
+        method: "POST",
+        body: JSON.stringify({ source, target, demand_mbps: demand }),
+      });
+      setState(next);
+      serviceDemand.value = "";
+      serviceDemand.focus();
+    } catch (error) {
+      showError(error.message);
+      await refresh();
+    } finally {
+      if (submitButton) submitButton.disabled = false;
+    }
+  });
+
+  serviceList?.addEventListener("click", async (event) => {
+    const button = event.target.closest(".revoke-button");
+    if (!button) return;
+    const serviceId = button.dataset.serviceId;
+    if (!serviceId || pendingRevokes.has(serviceId)) return;
+    pendingRevokes.add(serviceId);
+    renderServices();
+    try {
+      const next = await api(`/api/services/${encodeURIComponent(serviceId)}`, { method: "DELETE" });
+      setState(next);
+    } catch (error) {
+      showError(error.message);
+      refresh();
+    } finally {
+      pendingRevokes.delete(serviceId);
+      renderServices();
+    }
   });
 
   // Initial server-rendered state, then polling for command deadlines.

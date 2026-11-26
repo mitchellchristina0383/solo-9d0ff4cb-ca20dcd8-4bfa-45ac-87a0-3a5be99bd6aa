@@ -22,6 +22,67 @@
     </header>
 
     <main class="layout">
+      <section class="card services-card" data-testid="services-card">
+        <div class="card-head">
+          <h2>业务带宽预留 · 割接确认</h2>
+          <div id="service-summary" class="muted" data-testid="service-summary"></div>
+        </div>
+        <p class="muted small service-intro">
+          选择起点、终点交换机并填写<b>整数 Mbps</b> 登记业务。每条链路可预留
+          <b>100 Mbps</b>，<b>双向共用</b>同一额度。系统只按当前<b>实际转发路径</b>核查：
+          整条路径每一段都有足够剩余额度时才一次性占用；链路开始或停止转发时，路径未变的在用预留保留，
+          失效预留释放，再按登记顺序尝试接通其余业务。无路或带宽不足者继续等候，后面的申请仍可尝试；
+          撤销业务后按同一规则补位，重置演练会清空全部业务。
+        </p>
+        <form id="service-form" class="service-form" data-testid="service-form" novalidate>
+          <label class="field service-field" for="service-source">起点交换机
+            <select id="service-source" name="source" data-testid="service-source">
+              <option value="s1">交换机 1</option>
+              <option value="s2" selected>交换机 2</option>
+              <option value="s3">交换机 3</option>
+              <option value="s4">交换机 4</option>
+            </select>
+          </label>
+          <span class="service-arrow" aria-hidden="true">→</span>
+          <label class="field service-field" for="service-target">终点交换机
+            <select id="service-target" name="target" data-testid="service-target">
+              <option value="s1">交换机 1</option>
+              <option value="s2">交换机 2</option>
+              <option value="s3" selected>交换机 3</option>
+              <option value="s4">交换机 4</option>
+            </select>
+          </label>
+          <label class="field service-field service-demand" for="service-demand">约定带宽（整数 Mbps）
+            <input id="service-demand" name="demand_mbps" type="number" min="1" step="1"
+                   inputmode="numeric" placeholder="例如 50" autocomplete="off" required
+                   data-testid="service-demand" />
+          </label>
+          <button class="btn btn-primary service-submit" type="submit" id="service-submit"
+                  data-testid="service-submit">登记业务</button>
+        </form>
+        <div class="service-table-wrap">
+          <div class="table-wrap">
+            <table class="service-table">
+              <thead>
+                <tr>
+                  <th>登记顺序</th>
+                  <th>起止交换机</th>
+                  <th>约定带宽</th>
+                  <th>状态</th>
+                  <th>已预留路径 / 候选路径</th>
+                  <th>等待原因</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="service-list" data-testid="service-list"></tbody>
+            </table>
+          </div>
+          <div id="service-empty" class="empty-note" data-testid="service-empty">
+            尚未登记业务。选择起点 / 终点交换机、填写整数 Mbps 后点击“登记业务”。
+          </div>
+        </div>
+      </section>
+
       <section class="card topology-card">
         <div class="card-head">
           <h2>实际转发拓扑</h2>
@@ -99,6 +160,13 @@
                         data-action="plug" data-testid="plug-button-{{ link.id }}">
                   {{ '拔线' if link.plugged else '插回' }}
                 </button>
+              </div>
+              <div class="usage-block" data-role="usage" data-testid="link-usage-{{ link.id }}">
+                <div class="usage-head">
+                  <span>带宽预留（双向共用）</span>
+                  <span class="usage-num" data-role="usage-num">已预留 0 / 100 Mbps · 剩余 100</span>
+                </div>
+                <div class="usage-bar"><i data-role="usage-bar" data-level="normal" style="width: 0%"></i></div>
               </div>
               <div class="pending-note" data-role="pending-note" hidden></div>
             </article>

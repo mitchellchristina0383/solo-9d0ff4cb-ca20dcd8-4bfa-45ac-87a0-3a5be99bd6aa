@@ -146,6 +146,79 @@ def create_app(engine: Optional[NetworkEngine] = None, start_scheduler: bool = T
         except KeyError as exc:
             return jsonify({"error": str(exc)}), 404
 
+    @app.route("/api/services", methods=["GET", "POST"])
+    @app.route("/api/service", methods=["GET", "POST"])
+    @app.route("/api/reservations", methods=["GET", "POST"])
+    @app.route("/api/businesses", methods=["GET", "POST"])
+    @app.route("/api/business", methods=["GET", "POST"])
+    @app.post("/api/services/register")
+    @app.post("/api/service/register")
+    def services_collection():
+        engine: NetworkEngine = app.config["ENGINE"]
+        if request.method == "GET":
+            return jsonify(engine.snapshot())
+
+        data = _payload()
+        source = _first(data, "source", "source_id", "from", "src", "start_switch")
+        target = _first(
+            data, "target", "target_id", "to", "dst", "destination", "end_switch"
+        )
+        demand = _first(
+            data,
+            "demand_mbps",
+            "demandMbps",
+            "mbps_demand",
+            "demand",
+            "mbps",
+            "bw",
+            "bandwidth_mbps",
+            "rate_mbps",
+            "bandwidth",
+            "rate",
+        )
+        if source is None or target is None:
+            return jsonify({"error": "请选择起点交换机和终点交换机"}), 400
+        if demand is None:
+            return jsonify({"error": "请填写整数 Mbps 带宽需求（demand_mbps）"}), 400
+
+        try:
+            snapshot = engine.register_service(source, target, demand)
+        except KeyError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        # This codebase's action endpoints return the full drill snapshot; keep
+        # that shape and additionally expose the created row for clients that
+        # expect the resource directly.
+        row = snapshot["services"][-1]
+        snapshot["service"] = dict(row)
+        snapshot.update(row)
+        return jsonify(snapshot), 200
+
+    @app.route("/api/services/revoke", methods=["POST"])
+    def revoke_service_by_body():
+        engine: NetworkEngine = app.config["ENGINE"]
+        data = _payload()
+        service_id = _first(data, "service_id", "id", "service")
+        if not service_id:
+            return jsonify({"error": "service_id is required"}), 400
+        try:
+            return jsonify(engine.revoke_service(str(service_id)))
+        except KeyError as exc:
+            return jsonify({"error": str(exc)}), 404
+
+    @app.delete("/api/services/<service_id>")
+    @app.post("/api/services/<service_id>/revoke")
+    @app.post("/api/services/<service_id>/delete")
+    @app.post("/api/businesses/<service_id>/revoke")
+    def revoke_service(service_id: str):
+        engine: NetworkEngine = app.config["ENGINE"]
+        try:
+            return jsonify(engine.revoke_service(service_id))
+        except KeyError as exc:
+            return jsonify({"error": str(exc)}), 404
+
     @app.route("/api/broadcast", methods=["GET", "POST"])
     @app.route("/api/probe", methods=["GET", "POST"])
     def broadcast():
