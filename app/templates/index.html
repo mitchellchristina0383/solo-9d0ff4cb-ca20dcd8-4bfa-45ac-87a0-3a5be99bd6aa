@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>四台交换机环网倒换演练</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>四台交换机环网拔插与广播可达演练</h1>
+        <p class="subtitle">
+          可指定一条备用链路，并为各链路设置开通和阻塞延时。拔线立即停止转发，插回先保持阻塞；已下发命令不取消、不改期。全过程防止转发环路，无需切换的健康链路照常转发。
+        </p>
+      </div>
+      <div class="top-actions">
+        <div id="loop-free-badge" class="badge badge-ok" data-testid="loop-free-badge">检测中</div>
+        <div class="clock" data-testid="clock">演练时刻 0.0 s</div>
+        <button id="reset-btn" class="btn" type="button" data-testid="reset-button">重置演练</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="card topology-card">
+        <div class="card-head">
+          <h2>实际转发拓扑</h2>
+          <div id="forwarding-summary" class="muted" data-testid="forwarding-summary"></div>
+        </div>
+        <svg id="topology" viewBox="0 0 720 470" role="img" aria-label="四台交换机构成的环网拓扑" data-testid="topology"></svg>
+        <div class="legend" aria-label="图例">
+          <span><i class="line-sample forwarding"></i>实际转发</span>
+          <span><i class="line-sample blocked"></i>阻塞 / 备用</span>
+          <span><i class="line-sample down"></i>已拔线</span>
+          <span><i class="dot-sample pending"></i>有待生效命令</span>
+        </div>
+      </section>
+
+      <aside class="side-column">
+        <section class="card broadcast-card">
+          <h2>发送广播探测</h2>
+          <p class="muted small">可选择任一台交换机作为广播源。探测按那一刻真正处于 forwarding 的链路进行 BFS。</p>
+          <form id="broadcast-form" data-testid="broadcast-form">
+            <div class="source-grid" role="radiogroup" aria-label="广播源交换机">
+              <label class="source-option"><input type="radio" name="source" value="s1" data-testid="source-s1" checked /><span>交换机 1</span></label>
+              <label class="source-option"><input type="radio" name="source" value="s2" data-testid="source-s2" /><span>交换机 2</span></label>
+              <label class="source-option"><input type="radio" name="source" value="s3" data-testid="source-s3" /><span>交换机 3</span></label>
+              <label class="source-option"><input type="radio" name="source" value="s4" data-testid="source-s4" /><span>交换机 4</span></label>
+            </div>
+            <button class="btn btn-primary btn-large" type="submit" id="broadcast-btn" data-testid="broadcast-button">发送广播探测</button>
+          </form>
+          <div id="broadcast-result" class="probe-result" aria-live="polite" data-testid="broadcast-result">
+            <p class="muted">尚未发送探测。</p>
+          </div>
+        </section>
+
+        <section class="card links-card">
+          <div class="card-head">
+            <h2>链路、备用角色与延时</h2>
+            <label class="backup-select-field">
+              <span>指定备用链路</span>
+              <select id="backup-select" data-testid="backup-select" aria-label="指定备用链路">
+                <option value="l12" {{ 'selected' if initial_state.links | selectattr('id','equalto','l12') | first | attr('designated_backup') else '' }}>L12 · 交换机1—交换机2</option>
+                <option value="l23" {{ 'selected' if initial_state.links | selectattr('id','equalto','l23') | first | attr('designated_backup') else '' }}>L23 · 交换机2—交换机3</option>
+                <option value="l34" {{ 'selected' if initial_state.links | selectattr('id','equalto','l34') | first | attr('designated_backup') else '' }}>L34 · 交换机3—交换机4</option>
+                <option value="l41" {{ 'selected' if initial_state.links | selectattr('id','equalto','l41') | first | attr('designated_backup') else '' }}>L41 · 交换机4—交换机1</option>
+              </select>
+            </label>
+          </div>
+          <p class="muted small">延时单位为秒，可填 <code>0</code> 或小数。修改延时只影响之后新下发的命令；也可在每张链路卡片中选择“设为备用”。</p>
+          <div id="link-list" class="link-list" data-testid="link-list" data-rendered="1">
+            {% for link in initial_state.links %}
+            {% set state_label = '已拔线 · Down' if (not link.plugged or link.state == 'down') else ('实际转发' if link.state == 'forwarding' else '阻塞中') %}
+            <article class="link-card" data-link-id="{{ link.id }}" data-state="{{ link.state }}" data-testid="link-card-{{ link.id }}">
+              <div class="link-main">
+                <div>
+                  <span class="link-title">{{ link.name }}</span>
+                  <span class="link-ports">{{ link.source | upper }} ↔ {{ link.target | upper }}</span>
+                </div>
+                <span class="state-pill {{ link.state }}" data-testid="link-state-{{ link.id }}">{{ state_label }}</span>
+              </div>
+              <div class="link-grid">
+                <label class="field">开通延时（秒）
+                  <input type="number" min="0" max="600" step="0.1" class="open-delay"
+                         data-delay-field="open_delay_seconds" data-testid="open-delay-{{ link.id }}"
+                         value="{{ '%g' % (link.open_delay_ms / 1000) }}" />
+                </label>
+                <label class="field">阻塞延时（秒）
+                  <input type="number" min="0" max="600" step="0.1" class="block-delay"
+                         data-delay-field="block_delay_seconds" data-testid="block-delay-{{ link.id }}"
+                         value="{{ '%g' % (link.block_delay_ms / 1000) }}" />
+                </label>
+                <label class="backup-check" title="设为环网备用链路">
+                  <input type="radio" name="backup-link" class="backup-radio" value="{{ link.id }}"
+                         data-testid="backup-radio-{{ link.id }}" {{ 'checked' if link.designated_backup else '' }} />
+                  设为备用
+                </label>
+                <button type="button" class="btn plug-button {{ 'btn-danger' if link.plugged else 'btn-success' }}"
+                        data-action="plug" data-testid="plug-button-{{ link.id }}">
+                  {{ '拔线' if link.plugged else '插回' }}
+                </button>
+              </div>
+              <div class="pending-note" data-role="pending-note" hidden></div>
+            </article>
+            {% endfor %}
+          </div>
+        </section>
+      </aside>
+
+      <section class="card log-card">
+        <div class="card-head"><h2>已下发命令</h2><span class="muted">原定时刻不会因再次拔插而重算</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>#</th><th>链路</th><th>命令</th><th>下发时刻</th><th>原定生效</th><th>状态与结果</th></tr>
+            </thead>
+            <tbody id="command-list" data-testid="command-list"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card log-card">
+        <div class="card-head"><h2>事件日志</h2><span class="muted">拔线、插回、倒换和探测记录</span></div>
+        <div id="event-log" class="event-log" data-testid="event-log"></div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="alert" hidden></div>
+
+    <script>
+      window.__INITIAL_STATE__ = {{ initial_state | tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
